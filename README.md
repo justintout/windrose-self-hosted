@@ -225,7 +225,9 @@ Every variable below is consumed by the container entrypoint, so it applies iden
 |---|---|---|
 | `WINDROSE_WEBHOOK_URL` | `` | Generic JSON `POST` target. |
 | `WINDROSE_DISCORD_WEBHOOK_URL` | `` | Discord embed target. |
-| `WINDROSE_WEBHOOK_EVENTS` | `server.online,server.offline,player.join,player.leave` | Comma-separated subset. Additional events: `backup.created`, `backup.restored`, `config.applied`. |
+| `WINDROSE_WEBHOOK_EVENTS` | `server.online,server.offline,player.join,player.leave,game.update.available,game.update.scheduled` | Comma-separated subset. Additional opt-in success events: `backup.created`, `backup.restored`, `config.applied`. |
+| `WINDROSE_UPDATE_CHECK_SECONDS` | `900` | How often the UI sidecar polls Steam for the latest public-branch buildid of app 4129620. Floor 60s. |
+| `WINDROSE_UPDATE_GRACE_MINUTES` | `5` | Default grace period (minutes empty) before auto-update-when-empty triggers a restart. The toggle itself persists in `$R5_DIR/.update-policy.json`. |
 | `WINDROSE_WEBHOOK_POLL_SECONDS` | `15` | Poll cadence for the event detector thread. |
 | `WINDROSE_WEBHOOK_TIMEOUT` | `5` | HTTP POST timeout (seconds). |
 
@@ -476,6 +478,8 @@ Event types:
 | `backup.created`  | The admin console's **Create backup now**, `POST /api/backups`, or an auto-backup from the scheduler (payload includes `source: "auto"` + `reason: "idle"` or `"floor"`). |
 | `backup.restored` | A backup is restored via `POST /api/backups/{id}/restore` or a game auto-backup is merged via `POST /api/game-backups/{ts}/restore`. |
 | `config.applied`  | Config changes are applied via **Apply + restart**.                |
+| `game.update.available` | UI sidecar detects a newer public-branch buildid for app 4129620 than what SteamCMD wrote on the last `app_update`. Payload: `installedBuildId`, `latestBuildId`, `branch`, `appId`. One-shot per detected buildid; resets when installed catches up. |
+| `game.update.scheduled` | The auto-update-when-empty policy fired a restart. Payload: `installedBuildId`, `latestBuildId`, `idleSeconds`, `graceMinutes`. The actual update lands when the entrypoint pulls the new manifest on next boot. |
 
 Restrict the fired set with `WINDROSE_WEBHOOK_EVENTS` (comma-separated). Empty URLs disable delivery entirely — leave both URLs unset to suppress webhooks even if the event list is populated.
 

@@ -380,6 +380,31 @@
       </div>
     </div>
 
+    <div class="card" id="gameVersionCard">
+      <h2>Game version</h2>
+      <p class="muted">Compares the buildId SteamCMD wrote on the last <code>app_update</code> against the latest public-branch buildId reported by Steam. Updates apply automatically on next container restart — use the top-of-page <strong>Restart server</strong> button to apply now.</p>
+      <dl class="kv">
+        <dt>Installed buildId</dt><dd id="gvInstalled" class="mono">-</dd>
+        <dt>Latest buildId</dt><dd id="gvLatest" class="mono">-</dd>
+        <dt>Status</dt><dd id="gvStatus">-</dd>
+        <dt>Last checked</dt><dd id="gvLastChecked">-</dd>
+      </dl>
+      <div id="gvError" class="warn-inline row hidden"></div>
+      <div class="row admin-only hidden">
+        <button id="gvCheckBtn" type="button">Check now</button>
+      </div>
+      <hr>
+      <h3 class="admin-only hidden">Auto-update when empty</h3>
+      <p class="muted admin-only hidden">When on, the server schedules a restart-to-update once it has been empty (zero connected players) for at least the grace period. Honors the maintenance flag and waits for any in-flight auto-backup to finish.</p>
+      <div class="row admin-only hidden">
+        <label><input id="gvAutoUpdate" type="checkbox"> Auto-update when empty</label>
+      </div>
+      <div class="row admin-only hidden">
+        <label>Grace minutes <input id="gvGraceMinutes" type="number" min="1" step="1" value="5" style="width:5rem"></label>
+        <button id="gvSavePolicyBtn" type="button">Save policy</button>
+      </div>
+    </div>
+
     <!-- Manual update — advanced, collapsed by default -->
     <details class="card admin-only hidden" id="updateCard">
       <summary><h2><span id="importTitle">Manual WindowsServer Update</span></h2></summary>

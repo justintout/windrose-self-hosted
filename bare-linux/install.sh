@@ -271,6 +271,7 @@ _MANAGED_KEYS=" \
   WINDROSE_DISCORD_WEBHOOK_URL WINDROSE_WEBHOOK_URL \
   WINDROSE_WEBHOOK_EVENTS WINDROSE_WEBHOOK_POLL_SECONDS \
   WINDROSE_WEBHOOK_TIMEOUT \
+  WINDROSE_UPDATE_CHECK_SECONDS WINDROSE_UPDATE_GRACE_MINUTES \
 "
 
 PRESERVED_EXTRAS=""
@@ -377,11 +378,22 @@ UI_SERVE_STATIC=${UI_SERVE_STATIC:-true}
 #   player.join / player.leave       — AccountId appears in / drops from snapshot
 #   backup.created / backup.restored — /api/backups activity
 #   config.applied                   — admin console Apply + restart path
+#   game.update.available            — newer public-branch buildid detected
+#   game.update.scheduled            — auto-update-when-empty fired a restart
 WINDROSE_DISCORD_WEBHOOK_URL=${WINDROSE_DISCORD_WEBHOOK_URL:-}
 WINDROSE_WEBHOOK_URL=${WINDROSE_WEBHOOK_URL:-}
-WINDROSE_WEBHOOK_EVENTS=${WINDROSE_WEBHOOK_EVENTS:-server.online,server.offline,player.join,player.leave,backup.created,backup.restored,config.applied}
+WINDROSE_WEBHOOK_EVENTS=${WINDROSE_WEBHOOK_EVENTS:-server.online,server.offline,player.join,player.leave,backup.created,backup.restored,config.applied,game.update.available,game.update.scheduled}
 WINDROSE_WEBHOOK_POLL_SECONDS=${WINDROSE_WEBHOOK_POLL_SECONDS:-15}
 WINDROSE_WEBHOOK_TIMEOUT=${WINDROSE_WEBHOOK_TIMEOUT:-5}
+# Game-update detection. UI sidecar polls Steam every N seconds (floor 60s)
+# for the latest public-branch buildid of app 4129620 and compares to the
+# SteamCMD-managed appmanifest. Default 15 min keeps the steamcmd
+# subprocess off the 15s player-detection loop.
+WINDROSE_UPDATE_CHECK_SECONDS=${WINDROSE_UPDATE_CHECK_SECONDS:-900}
+# Default grace period (minutes empty) before auto-update-when-empty
+# triggers a restart. The toggle itself is persisted in
+# $R5_DIR/.update-policy.json by the admin UI; this only seeds defaults.
+WINDROSE_UPDATE_GRACE_MINUTES=${WINDROSE_UPDATE_GRACE_MINUTES:-5}
 EOF
 
 # Preserve operator-added keys (anything NOT in _MANAGED_KEYS that

@@ -55,10 +55,12 @@ ui:
   # webhooks.pollSeconds. Empty URLs disable delivery.
   #
   # Supported events: server.online, server.offline, player.join,
-  # player.leave, config.applied, backup.created, backup.restored.
+  # player.leave, config.applied, backup.created, backup.restored,
+  # game.update.available, game.update.scheduled.
   webhooks:
-    # Comma-separated. Defaults to the online/offline + join/leave set.
-    events: "server.online,server.offline,player.join,player.leave"
+    # Comma-separated. Defaults to online/offline + join/leave +
+    # the two game-update events (failures-and-attention pattern).
+    events: "server.online,server.offline,player.join,player.leave,game.update.available,game.update.scheduled"
     pollSeconds: 15
     timeout: 5
     # Generic JSON POST target. Accepts any endpoint that can take an
@@ -72,6 +74,19 @@ ui:
     discordUrlSecret:
       name: ""
       key: discord-webhook-url
+  # Game-update detection. The UI sidecar polls Steam every
+  # updateCheck.intervalSeconds for the latest public-branch buildid
+  # of app 4129620 and compares to the SteamCMD-managed appmanifest.
+  # Mismatch fires `game.update.available` (one-shot per detected
+  # buildid) and surfaces in the admin UI's Game Version card.
+  updateCheck:
+    # 15 min — fast enough that operators see updates within a quarter
+    # hour, slow enough that we're not spamming Steam.
+    intervalSeconds: 900
+    # Default grace period for the auto-update-when-empty toggle.
+    # Persists in $R5_DIR/.update-policy.json once the operator saves
+    # from the admin UI; this only seeds the initial value.
+    graceMinutesDefault: 5
 
 persistence:
   existingClaim: ""

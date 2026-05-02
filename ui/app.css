@@ -252,6 +252,7 @@ tr.muted-row td { color: var(--text-dim); }
 .form-grid > .field { display: flex; gap: 0.5rem; align-items: center; }
 .inline-row { display: flex; gap: 0.5rem; align-items: center; }
 .warn-inline { color: var(--banner-text); background: var(--banner-bg); border-left: 3px solid var(--banner-border); padding: 0.3rem 0.6rem; font-size: 0.85rem; border-radius: 3px; }
+.update-badge { display: inline-block; background: #ff8c00; color: #fff; font-weight: 600; padding: 0.15rem 0.55rem; border-radius: 3px; font-size: 0.85rem; }
 .diff { font-family: ui-monospace, monospace; font-size: 0.85rem; background: var(--diff-bg); border: 1px solid var(--diff-border); border-radius: 4px; padding: 0.5rem; max-height: 20rem; overflow: auto; white-space: pre; color: var(--text); }
 .diff .add { background: var(--diff-add-bg); color: var(--diff-add-text); display: block; }
 .diff .del { background: var(--diff-del-bg); color: var(--diff-del-text); display: block; }

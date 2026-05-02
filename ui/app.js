@@ -119,6 +119,17 @@ const ipDisableBtn      = document.getElementById("ipDisableBtn");
 const ipAutoBtn         = document.getElementById("ipAutoBtn");
 const ipApplyRestartBtn = document.getElementById("ipApplyRestartBtn");
 
+// Game version + auto-update policy card
+const gvInstalled       = document.getElementById("gvInstalled");
+const gvLatest          = document.getElementById("gvLatest");
+const gvStatus          = document.getElementById("gvStatus");
+const gvLastChecked     = document.getElementById("gvLastChecked");
+const gvError           = document.getElementById("gvError");
+const gvCheckBtn        = document.getElementById("gvCheckBtn");
+const gvAutoUpdate      = document.getElementById("gvAutoUpdate");
+const gvGraceMinutes    = document.getElementById("gvGraceMinutes");
+const gvSavePolicyBtn   = document.getElementById("gvSavePolicyBtn");
+
 const kv = {
   serverName: document.getElementById("kvServerName"),
   files: document.getElementById("kvFiles"),
@@ -724,7 +735,7 @@ function applyStatus(data) {
   // modal before our sign-in button is even clicked).
   if (showAdmin && !window._adminHydrated) {
     window._adminHydrated = true;
-    loadConfig(); loadBackups(); loadMods(); loadBackupConfig(); loadIdlePatch(); loadMaintenance();
+    loadConfig(); loadBackups(); loadMods(); loadBackupConfig(); loadIdlePatch(); loadMaintenance(); loadGameVersion();
   } else if (!showAdmin) {
     window._adminHydrated = false;
   }
@@ -743,7 +754,9 @@ function applyStatus(data) {
   // "Discard all staged" visible in the same window.
   const stagedWorldCount = Array.isArray(data.stagedWorlds) ? data.stagedWorlds.length : 0;
   const anyStaged = !!data.stagedConfigPending || stagedWorldCount > 0 || !!data.stagedModsPending;
-  restartServerBtn.textContent = anyStaged ? "Apply + restart" : "Restart server";
+  let restartLabel = anyStaged ? "Apply + restart" : "Restart server";
+  if (window._gameUpdateAvailable) restartLabel += " (update available)";
+  restartServerBtn.textContent = restartLabel;
   discardAllStagedBtn.classList.toggle("hidden", !anyStaged);
 
   // Stop + Start visibility: only show on bare-Linux where the polkit
@@ -976,6 +989,78 @@ function renderIdlePatch(s) {
   ipAutoBtn.disabled    = s.override === "auto";
 }
 
+// --- Game version + auto-update policy ---------------------------
+async function loadGameVersion() {
+  try {
+    // /api/game-version is public — no auth header needed for the read.
+    const res = await fetch("/api/game-version");
+    if (!res.ok) return;
+    renderGameVersion(await res.json());
+  } catch (err) { log("game-version load failed: " + err); }
+}
+
+function renderGameVersion(s) {
+  gvInstalled.textContent = s.installedBuildId || "unknown";
+  gvLatest.textContent    = s.latestBuildId    || "unknown";
+  gvLastChecked.textContent = s.lastCheckedAt  || "never";
+  if (s.lastError) {
+    gvError.textContent = s.lastError;
+    gvError.classList.remove("hidden");
+  } else {
+    gvError.classList.add("hidden");
+  }
+  if (s.updateAvailable) {
+    gvStatus.innerHTML = '<span class="update-badge">update available</span>';
+    window._gameUpdateAvailable = true;
+  } else if (s.installedBuildId && s.latestBuildId) {
+    gvStatus.textContent = "up to date";
+    window._gameUpdateAvailable = false;
+  } else {
+    gvStatus.textContent = "checking…";
+  }
+  // Refresh the top-of-page restart label so the badge appears without
+  // waiting for the next /api/status poll.
+  if (typeof loadStatus === "function") loadStatus();
+  // Render policy if present in the response (combined GET).
+  const p = s.policy || {};
+  if (typeof p.autoUpdateWhenEmpty === "boolean") {
+    gvAutoUpdate.checked = p.autoUpdateWhenEmpty;
+  }
+  if (typeof p.graceMinutes === "number") {
+    gvGraceMinutes.value = p.graceMinutes;
+  }
+}
+
+async function triggerGameVersionCheck() {
+  log("forcing game-version check (steamcmd may take ~5–10s)…");
+  gvCheckBtn.disabled = true;
+  try {
+    const res = await authFetch("/api/game-version/check", { method: "POST" });
+    if (!res.ok) { log(`game-version check failed: ${await res.text()}`); return; }
+    renderGameVersion(await res.json());
+    log("game-version check complete");
+  } finally {
+    gvCheckBtn.disabled = false;
+  }
+}
+
+async function saveUpdatePolicy() {
+  const body = {
+    autoUpdateWhenEmpty: gvAutoUpdate.checked,
+    graceMinutes:        Number(gvGraceMinutes.value) || 5,
+  };
+  const res = await authFetch("/api/update-policy", {
+    method: "PUT",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) { log(`update-policy save failed: ${await res.text()}`); return; }
+  const merged = await res.json();
+  gvAutoUpdate.checked = merged.autoUpdateWhenEmpty;
+  gvGraceMinutes.value = merged.graceMinutes;
+  log(`update policy saved: autoUpdateWhenEmpty=${merged.autoUpdateWhenEmpty} grace=${merged.graceMinutes}min`);
+}
+
 async function setIdlePatchOverride(value, restart = false) {
   log(`idle-patch override -> ${value}${restart ? " + restart" : ""}...`);
   const res = await authFetch("/api/idle-cpu-patch", {
@@ -1011,7 +1096,9 @@ async function stageConfig(json) {
 }
 
 // --- Event wiring -------------------------------------------------
-refreshBtn.addEventListener("click", () => { loadStatus(); loadConfig(); loadBackups(); loadMods(); loadBackupConfig(); loadIdlePatch(); loadMaintenance(); });
+refreshBtn.addEventListener("click", () => { loadStatus(); loadConfig(); loadBackups(); loadMods(); loadBackupConfig(); loadIdlePatch(); loadMaintenance(); loadGameVersion(); });
+gvCheckBtn.addEventListener("click", triggerGameVersionCheck);
+gvSavePolicyBtn.addEventListener("click", saveUpdatePolicy);
 downloadSavesBtn.addEventListener("click", () => { window.location.href = "/api/saves/download"; });
 
 uploadBtn.addEventListener("click", async () => {
@@ -1466,3 +1553,7 @@ setInterval(loadStatus, 5000);
 setInterval(() => { if (window._adminHydrated) { loadBackups(); loadBackupConfig(); } }, 30000);
 setInterval(() => { if (window._adminHydrated) loadIdlePatch(); }, 30000);
 setInterval(() => { if (window._adminHydrated) loadMaintenance(); }, 30000);
+// Game version is public — refresh independent of admin hydration so the
+// public landing page also surfaces "update available" without a sign-in.
+setInterval(loadGameVersion, 60000);
+loadGameVersion();

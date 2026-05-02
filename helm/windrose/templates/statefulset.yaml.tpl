@@ -223,6 +223,14 @@ spec:
               value: {{ .pollSeconds | quote }}
             - name: WINDROSE_WEBHOOK_TIMEOUT
               value: {{ .timeout | quote }}
+            {{- end }}
+            {{- with .Values.ui.updateCheck }}
+            - name: WINDROSE_UPDATE_CHECK_SECONDS
+              value: {{ .intervalSeconds | quote }}
+            - name: WINDROSE_UPDATE_GRACE_MINUTES
+              value: {{ .graceMinutesDefault | quote }}
+            {{- end }}
+            {{- with .Values.ui.webhooks }}
             {{- if .urlSecret.name }}
             - name: WINDROSE_WEBHOOK_URL
               valueFrom:

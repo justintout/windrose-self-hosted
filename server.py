@@ -160,6 +160,28 @@ MAINTENANCE_FLAG_FILE = Path(os.environ.get(
 # RHEL / some Docker setups) a large save can OOM the host mid-stream.
 # Point this at a PVC-backed path (e.g. /home/steam/tmp) on those hosts.
 SAVES_DOWNLOAD_SCRATCH_DIR = os.environ.get("WINDROSE_DOWNLOAD_SCRATCH_DIR", "/tmp")
+# Game-update detection. We compare the buildid SteamCMD wrote on the
+# last `app_update` (read from the appmanifest .acf in WINDROSE_SERVER_DIR)
+# against the latest buildid for app 4129620's `public` branch reported by
+# `steamcmd +login anonymous +app_info_print 4129620`. Mismatch → fire a
+# game.update.available webhook and surface in the UI.
+STEAM_APP_ID          = os.environ.get("WINDROSE_STEAM_APP_ID", "4129620")
+STEAMCMD_PATH         = Path(os.environ.get("STEAMCMD_PATH", str(Path.home() / "steamcmd")))
+APPMANIFEST_PATH      = WINDROSE_SERVER_DIR / "steamapps" / f"appmanifest_{STEAM_APP_ID}.acf"
+APPMANIFEST_FALLBACK  = STEAMCMD_PATH / "steamapps" / f"appmanifest_{STEAM_APP_ID}.acf"
+# Floor at 60 s so a misconfig can't hammer Steam. 15 min default keeps
+# the steamcmd subprocess off the EventDetector's 15 s loop.
+UPDATE_CHECK_SECONDS  = max(60.0, float(os.environ.get("WINDROSE_UPDATE_CHECK_SECONDS", "900")))
+# Auto-update-when-empty policy. Toggle persists in this file (mirrors
+# .backup-config.json idiom). Env vars only seed initial defaults.
+UPDATE_POLICY_PATH    = Path(os.environ.get(
+    "WINDROSE_UPDATE_POLICY_PATH",
+    str(R5_DIR / ".update-policy.json"),
+))
+UPDATE_POLICY_GRACE_MINUTES_DEFAULT = float(os.environ.get("WINDROSE_UPDATE_GRACE_MINUTES", "5"))
+# Poll cadence for the auto-apply scheduler thread. 30 s is plenty —
+# we're waiting on a multi-minute idle window.
+UPDATE_POLICY_POLL_SECONDS = float(os.environ.get("WINDROSE_UPDATE_POLICY_POLL_SECONDS", "30"))
 # First: the Docker / bare-Linux install target. Second: the repo-root
 # source-run fallback (server.py at repo root, patch-idle-cpu.py lives
 # under scripts/).
@@ -170,11 +192,188 @@ PATCH_SCRIPT_CANDIDATES = [
 _PATCH_STATE_CACHE: dict = {"mtime": None, "md5": None, "state": None, "reason": None}
 _PATCH_STATE_LOCK = threading.Lock()
 
+# --- Game-version detection -------------------------------------------------
+# Module-level state shared between UpdateAvailabilityChecker (the
+# polling thread), UpdateAutomationScheduler (the auto-restart thread),
+# and the /api/game-version routes. The lock is fine-grained — the
+# steamcmd subprocess takes its own _STEAMCMD_LOCK so a slow Steam call
+# can't block the cached-status reader.
+_UPDATE_STATE_LOCK = threading.Lock()
+_UPDATE_STATUS_CACHE: dict = {
+    "installedBuildId": None,
+    "latestBuildId":    None,
+    "updateAvailable":  False,
+    "lastCheckedAt":    None,
+    "lastError":        None,
+    "branch":           "public",
+    "appId":            STEAM_APP_ID,
+}
+_LAST_FIRED_AVAILABLE_BUILDID: str | None = None
+_STEAMCMD_LOCK = threading.Lock()
+
+_ACF_KV_RE = re.compile(r'"([^"]+)"\s+"([^"]*)"')
+
+def _parse_acf_flat(text: str) -> dict[str, str]:
+    """Extract every quoted key/value pair from an ACF/VDF document.
+    Used to read `buildid` from the SteamCMD-managed appmanifest. ACF is
+    a small superset of JSON (bracketed sections, no commas) but for the
+    fields we care about — top-level scalars in `AppState` — a flat
+    regex is sufficient: only one `buildid` key in the whole file."""
+    return dict(_ACF_KV_RE.findall(text))
+
+def _parse_app_info_branch_buildid(text: str, branch: str = "public") -> str | None:
+    """Parse `steamcmd +app_info_print` output and return the buildid for
+    the named branch.
+
+    The output is bracketed VDF, e.g.
+        "branches"
+        {
+            "public"
+            {
+                "buildid"  "12345678"
+                ...
+            }
+            "beta" { ... }
+        }
+    The flat regex from above matches every "buildid" key (one per
+    branch), so we need a small scoped state machine that tracks the
+    section stack and only emits when stack ends in `branches.<branch>`."""
+    stack: list[str] = []
+    pending_key: str | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line == "{":
+            if pending_key is not None:
+                stack.append(pending_key); pending_key = None
+            continue
+        if line == "}":
+            if stack:
+                stack.pop()
+            pending_key = None
+            continue
+        m = _ACF_KV_RE.match(line)
+        if m:
+            k, v = m.group(1), m.group(2)
+            if k == "buildid" and len(stack) >= 2 and stack[-2] == "branches" and stack[-1] == branch:
+                return v
+            pending_key = None
+            continue
+        # Bare `"key"` line — value is on the next opening brace.
+        m2 = re.match(r'"([^"]+)"\s*$', line)
+        if m2:
+            pending_key = m2.group(1)
+    return None
+
+def read_installed_buildid() -> tuple[str | None, str | None]:
+    """Return (buildid, error). Tries the canonical install-dir manifest
+    first, then the SteamCMD-relative fallback. None when neither is
+    readable — caller surfaces this as 'unknown' in the UI."""
+    for path in (APPMANIFEST_PATH, APPMANIFEST_FALLBACK):
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(errors="replace")
+        except OSError as e:
+            return None, f"manifest-read-failed: {e}"
+        flat = _parse_acf_flat(text)
+        bid = flat.get("buildid")
+        if bid:
+            return bid, None
+    return None, "manifest-missing"
+
+def query_latest_buildid(timeout: float = 30.0) -> tuple[str | None, str | None]:
+    """Spawn `steamcmd +login anonymous +app_info_print <appid> +quit`
+    and pull the public-branch buildid out of its output. Best-effort:
+    returns (None, reason) on any failure so the caller can surface it
+    without crashing the polling loop."""
+    cmd_path = STEAMCMD_PATH / "steamcmd.sh"
+    if not cmd_path.is_file():
+        return None, "steamcmd-unavailable"
+    args = [
+        str(cmd_path),
+        "+login", "anonymous",
+        "+app_info_print", STEAM_APP_ID,
+        "+quit",
+    ]
+    with _STEAMCMD_LOCK:
+        try:
+            r = subprocess.run(
+                args, capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return None, "steamcmd-timeout"
+        except OSError as e:
+            return None, f"steamcmd-spawn-failed: {e}"
+    if r.returncode != 0:
+        return None, f"steamcmd-rc-{r.returncode}"
+    bid = _parse_app_info_branch_buildid(r.stdout, branch="public")
+    if not bid:
+        return None, "buildid-not-found"
+    return bid, None
+
+def _compare_buildids(installed: str | None, latest: str | None) -> bool:
+    """True iff a strict update is available. Steam buildids are
+    monotonic positive integers; compare numerically when possible and
+    fall back to string inequality so a malformed manifest never crashes."""
+    if not installed or not latest:
+        return False
+    try:
+        return int(latest) > int(installed)
+    except (ValueError, TypeError):
+        return latest != installed
+
+def game_version_full_status() -> dict:
+    """Snapshot of the cached state. Cheap; reads under the state lock."""
+    with _UPDATE_STATE_LOCK:
+        return dict(_UPDATE_STATUS_CACHE)
+
+# --- Update policy (auto-update-when-empty) ---------------------------------
+_UPDATE_POLICY_DEFAULTS = {
+    "autoUpdateWhenEmpty": False,
+    "graceMinutes":        UPDATE_POLICY_GRACE_MINUTES_DEFAULT,
+}
+
+def _load_update_policy() -> dict:
+    """Effective policy = defaults overlaid with operator overrides
+    (atomic JSON file). Same pattern as effective_backup_config()."""
+    out = dict(_UPDATE_POLICY_DEFAULTS)
+    try:
+        if UPDATE_POLICY_PATH.is_file():
+            data = json.loads(UPDATE_POLICY_PATH.read_text())
+            if isinstance(data, dict):
+                if isinstance(data.get("autoUpdateWhenEmpty"), bool):
+                    out["autoUpdateWhenEmpty"] = data["autoUpdateWhenEmpty"]
+                gm = data.get("graceMinutes")
+                if isinstance(gm, (int, float)) and gm >= 1:
+                    out["graceMinutes"] = float(gm)
+    except (OSError, ValueError) as e:
+        print(f"[update-policy] read failed: {e}; using defaults", file=sys.stderr, flush=True)
+    return out
+
+def _save_update_policy(payload: dict) -> dict:
+    """Validate + persist atomically. Returns the merged effective policy."""
+    out = dict(_UPDATE_POLICY_DEFAULTS)
+    if isinstance(payload.get("autoUpdateWhenEmpty"), bool):
+        out["autoUpdateWhenEmpty"] = payload["autoUpdateWhenEmpty"]
+    gm = payload.get("graceMinutes")
+    if isinstance(gm, (int, float)):
+        # Floor at 1 min to prevent foot-guns. No upper bound — operators
+        # can set "12 hours empty" if they want.
+        out["graceMinutes"] = float(max(1.0, gm))
+    UPDATE_POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = UPDATE_POLICY_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(out, indent=2))
+    tmp.replace(UPDATE_POLICY_PATH)
+    return out
+
 # --- Webhooks ---------------------------------------------------------------
 WEBHOOK_URL           = os.environ.get("WINDROSE_WEBHOOK_URL", "").strip()
 WEBHOOK_DISCORD_URL   = os.environ.get("WINDROSE_DISCORD_WEBHOOK_URL", "").strip()
 WEBHOOK_EVENTS_RAW    = os.environ.get("WINDROSE_WEBHOOK_EVENTS",
-    "server.online,server.offline,player.join,player.leave").strip()
+    "server.online,server.offline,player.join,player.leave,"
+    "game.update.available,game.update.scheduled").strip()
 WEBHOOK_TIMEOUT       = float(os.environ.get("WINDROSE_WEBHOOK_TIMEOUT", "5"))
 WEBHOOK_POLL_SECONDS  = float(os.environ.get("WINDROSE_WEBHOOK_POLL_SECONDS", "15"))
 WEBHOOK_EVENTS        = {e.strip() for e in WEBHOOK_EVENTS_RAW.split(",") if e.strip()}
@@ -2016,13 +2215,15 @@ def handle_upload(body_stream, content_length: int, filename: str) -> dict:
 # gets a raw JSON body.
 
 _WEBHOOK_COLORS = {
-    "server.online":  0x2ecc71,   # green
-    "server.offline": 0xe74c3c,   # red
-    "player.join":    0x3498db,   # blue
-    "player.leave":   0x95a5a6,   # grey
-    "config.applied": 0xf1c40f,   # yellow
-    "backup.created": 0x9b59b6,   # purple
-    "backup.restored": 0x8e44ad,
+    "server.online":          0x2ecc71,   # green
+    "server.offline":         0xe74c3c,   # red
+    "player.join":            0x3498db,   # blue
+    "player.leave":           0x95a5a6,   # grey
+    "config.applied":         0xf1c40f,   # yellow
+    "backup.created":         0x9b59b6,   # purple
+    "backup.restored":        0x8e44ad,
+    "game.update.available":  0xff8c00,   # orange — attention but not alarm
+    "game.update.scheduled":  0xe67e22,   # darker orange — committed action
 }
 
 def redact_url(url: str) -> str:
@@ -2077,6 +2278,15 @@ def build_discord_payload(event: dict) -> dict:
         lines.append("Staged config applied — server restarting.")
     elif name in ("backup.created", "backup.restored"):
         lines.append(f"Backup: `{event.get('backupId','?')}`")
+    elif name == "game.update.available":
+        lines.append(f"**Installed:** `{event.get('installedBuildId','?')}`")
+        lines.append(f"**Latest:** `{event.get('latestBuildId','?')}`")
+        lines.append("Restart the server container to apply.")
+    elif name == "game.update.scheduled":
+        lines.append(f"**Installed:** `{event.get('installedBuildId','?')}`")
+        lines.append(f"**Latest:** `{event.get('latestBuildId','?')}`")
+        idle = int(event.get("idleSeconds", 0))
+        lines.append(f"Server has been empty {idle // 60} min — restarting now to apply update.")
     footer = f"{event.get('serverName','Windrose')} · {event.get('timestamp','')}"
     return {
         "embeds": [{
@@ -2171,6 +2381,179 @@ class EventDetector(threading.Thread):
             except Exception as e:  # noqa: BLE001
                 print(f"[event-detector] error: {e}", file=sys.stderr, flush=True)
 
+
+class UpdateAvailabilityChecker(threading.Thread):
+    """Polls Steam for the latest public-branch buildid on a slow clock
+    (UPDATE_CHECK_SECONDS, default 900 s). Caches the result in
+    _UPDATE_STATUS_CACHE so the GET route is instant. Fires
+    `game.update.available` exactly once per newly-detected latest
+    buildid (idempotent via _LAST_FIRED_AVAILABLE_BUILDID); resets the
+    one-shot flag once the operator restarts and the installed buildid
+    catches up.
+
+    Independent thread (not a gated branch in EventDetector) so a slow
+    steamcmd subprocess can't delay the 15 s player-join/leave loop."""
+    def __init__(self):
+        super().__init__(daemon=True, name="windrose-update-checker")
+        # Short warm-up before the first check — gives the entrypoint's
+        # own app_update time to write the appmanifest on a fresh boot.
+        self._initial_delay = 30.0
+
+    def check_now(self) -> dict:
+        """Run a check synchronously and update the cache. Safe to call
+        from the polling thread or from the manual /api/game-version/check
+        route — _STEAMCMD_LOCK serializes the subprocess invocation."""
+        installed, manifest_err = read_installed_buildid()
+        latest, query_err = query_latest_buildid()
+        update_available = _compare_buildids(installed, latest)
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        # Combine the two error sources (manifest read vs steamcmd) so
+        # the UI can surface the most-actionable one without us picking.
+        error = manifest_err or query_err
+        with _UPDATE_STATE_LOCK:
+            _UPDATE_STATUS_CACHE["installedBuildId"] = installed
+            _UPDATE_STATUS_CACHE["latestBuildId"]    = latest
+            _UPDATE_STATUS_CACHE["updateAvailable"]  = update_available
+            _UPDATE_STATUS_CACHE["lastCheckedAt"]    = now_iso
+            _UPDATE_STATUS_CACHE["lastError"]        = error
+            snapshot = dict(_UPDATE_STATUS_CACHE)
+        self._maybe_fire_event(installed, latest, update_available)
+        return snapshot
+
+    def _maybe_fire_event(self, installed: str | None, latest: str | None,
+                          update_available: bool) -> None:
+        global _LAST_FIRED_AVAILABLE_BUILDID
+        with _UPDATE_STATE_LOCK:
+            if update_available:
+                if latest != _LAST_FIRED_AVAILABLE_BUILDID:
+                    _LAST_FIRED_AVAILABLE_BUILDID = latest
+                    fire_now = True
+                else:
+                    fire_now = False
+            else:
+                # Reset the one-shot so a future `latest > installed`
+                # transition re-fires.
+                _LAST_FIRED_AVAILABLE_BUILDID = None
+                fire_now = False
+        if fire_now:
+            fire_event("game.update.available",
+                       installedBuildId=installed,
+                       latestBuildId=latest,
+                       branch="public",
+                       appId=STEAM_APP_ID)
+
+    def run(self) -> None:
+        time.sleep(self._initial_delay)
+        while True:
+            try:
+                self.check_now()
+            except Exception as e:  # noqa: BLE001 — never let the loop die
+                print(f"[update-checker] error: {e}", file=sys.stderr, flush=True)
+            time.sleep(UPDATE_CHECK_SECONDS)
+
+
+class UpdateAutomationScheduler(threading.Thread):
+    """When `autoUpdateWhenEmpty` is on AND an update is available AND
+    the server has been empty for >= graceMinutes AND the operator
+    didn't just stop/restart manually, fire `game.update.scheduled` and
+    call request_restart(). The next entrypoint boot pulls the new
+    buildid via SteamCMD.
+
+    State machine mirrors AutoBackupScheduler's idle/floor design:
+      - players empty → start a clock (_players_zero_since)
+      - players reappear → reset the clock
+      - threshold met + update available → trigger once, then wait for
+        the post-boot UpdateAvailabilityChecker to clear updateAvailable
+        before re-arming."""
+    def __init__(self):
+        super().__init__(daemon=True, name="windrose-update-automation")
+        self._players_zero_since: float | None = None
+        self._fired_for_buildid: str | None = None
+
+    def _seconds_empty(self, now: float) -> float:
+        if self._players_zero_since is None:
+            return 0.0
+        return max(0.0, now - self._players_zero_since)
+
+    def _tick(self) -> None:
+        policy = _load_update_policy()
+        status = game_version_full_status()
+        latest = status.get("latestBuildId")
+        update_available = bool(status.get("updateAvailable"))
+        # Re-arm: once the operator's restart lands and updateAvailable
+        # flips back to False, drop the fired flag so a *future* update
+        # can also auto-apply.
+        if not update_available:
+            self._fired_for_buildid = None
+        if not policy["autoUpdateWhenEmpty"]:
+            return
+        if not update_available:
+            return
+        # Player-count snapshot. parse_active_players() reads the same
+        # log tail the EventDetector uses; a short read is cheap.
+        try:
+            players = parse_active_players()
+        except Exception:  # noqa: BLE001
+            players = []
+        now = time.time()
+        if players:
+            self._players_zero_since = None
+            return
+        if self._players_zero_since is None:
+            self._players_zero_since = now
+            return
+        # Honor the maintenance flag — entrypoint reads it on boot and
+        # holds the container in a sleep-loop instead of launching the
+        # game, so a restart while it's set is wasted work.
+        if MAINTENANCE_FLAG_FILE.is_file():
+            return
+        # Don't restart mid-backup: if an auto-backup landed *after* the
+        # idle clock started, the system is mid-cycle; wait one tick.
+        with _auto_state_lock:
+            last_auto = _auto_state.get("lastAutoBackupAt")
+        if last_auto and last_auto > self._players_zero_since:
+            # Auto-backup just fired during this idle window — give it a
+            # poll to settle before triggering a restart.
+            return
+        idle_seconds = self._seconds_empty(now)
+        threshold = policy["graceMinutes"] * 60.0
+        if idle_seconds < threshold:
+            return
+        # One-shot per latest buildid: don't keep retrying if the
+        # restart machinery is wedged.
+        if self._fired_for_buildid == latest:
+            return
+        installed = status.get("installedBuildId")
+        print(f"[update-automation] firing scheduled update: installed={installed} "
+              f"latest={latest} idleSeconds={int(idle_seconds)}",
+              file=sys.stderr, flush=True)
+        fire_event("game.update.scheduled",
+                   installedBuildId=installed,
+                   latestBuildId=latest,
+                   idleSeconds=int(idle_seconds),
+                   graceMinutes=policy["graceMinutes"],
+                   branch="public",
+                   appId=STEAM_APP_ID)
+        self._fired_for_buildid = latest
+        try:
+            request_restart()
+        except Exception as e:  # noqa: BLE001
+            print(f"[update-automation] request_restart failed: {e}",
+                  file=sys.stderr, flush=True)
+
+    def run(self) -> None:
+        while True:
+            time.sleep(UPDATE_POLICY_POLL_SECONDS)
+            try:
+                self._tick()
+            except Exception as e:  # noqa: BLE001
+                print(f"[update-automation] error: {e}", file=sys.stderr, flush=True)
+
+
+# Module-level singleton so the route handlers can reach the live
+# checker (for the manual-check route). Set in __main__ below.
+_UPDATE_CHECKER: UpdateAvailabilityChecker | None = None
+
 # --- Handler ----------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     server_version = "Windrose-Admin/1.0"
@@ -2219,6 +2602,10 @@ class Handler(BaseHTTPRequestHandler):
         ("POST",   "/api/idle-cpu-patch",     "_api_idle_patch_post"),
         ("GET",    "/api/maintenance",        "_api_maintenance_get"),
         ("POST",   "/api/maintenance",        "_api_maintenance_post"),
+        ("GET",    "/api/game-version",       "_api_game_version_get"),
+        ("POST",   "/api/game-version/check", "_api_game_version_check"),
+        ("GET",    "/api/update-policy",      "_api_update_policy_get"),
+        ("PUT",    "/api/update-policy",      "_api_update_policy_put"),
         # /api/backups/{id}/restore, /api/worlds/{id}/upload, and
         # /api/worlds/{id}/config handled in _dispatch dynamically.
     ]
@@ -2226,7 +2613,8 @@ class Handler(BaseHTTPRequestHandler):
     # Open paths stay reachable without auth — the public view. Everything
     # else gates on Authorization. /api/status is open but REDACTS fields
     # when the caller isn't authenticated (see _api_status).
-    PUBLIC_PATHS: set[str] = {"/", "/healthz", "/index.html", "/app.css", "/app.js", "/api/status"}
+    PUBLIC_PATHS: set[str] = {"/", "/healthz", "/index.html", "/app.css", "/app.js",
+                              "/api/status", "/api/game-version"}
 
     def _dispatch(self, method: str):
         path = urllib.parse.urlparse(self.path).path
@@ -3030,6 +3418,48 @@ class Handler(BaseHTTPRequestHandler):
                 status["restartError"] = str(e)
         self._json(HTTPStatus.OK, status)
 
+    def _api_game_version_get(self):
+        """Cached snapshot — instant. Includes the current persisted
+        update policy so the UI can render the toggle in one round-trip."""
+        status = game_version_full_status()
+        status["policy"] = _load_update_policy()
+        self._json(HTTPStatus.OK, status)
+
+    def _api_game_version_check(self):
+        """Force a fresh check. Spawns a 5–10 s steamcmd subprocess —
+        gated behind allow_destructive() because it's a non-trivial
+        external call that would amplify trivially as a DoS if open."""
+        if not allow_destructive():
+            self._forbidden(); return
+        if _UPDATE_CHECKER is None:
+            self._send(HTTPStatus.SERVICE_UNAVAILABLE, "text/plain",
+                       b"update checker not running\n"); return
+        status = _UPDATE_CHECKER.check_now()
+        status["policy"] = _load_update_policy()
+        self._json(HTTPStatus.OK, status)
+
+    def _api_update_policy_get(self):
+        self._json(HTTPStatus.OK, {
+            **_load_update_policy(),
+            "defaults":      dict(_UPDATE_POLICY_DEFAULTS),
+            "overridePath":  str(UPDATE_POLICY_PATH),
+            "overrideExists": UPDATE_POLICY_PATH.is_file(),
+        })
+
+    def _api_update_policy_put(self):
+        if not allow_destructive():
+            self._forbidden(); return
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length) if length > 0 else b""
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._send(HTTPStatus.BAD_REQUEST, "text/plain", b"invalid JSON body\n"); return
+        if not isinstance(payload, dict):
+            self._send(HTTPStatus.BAD_REQUEST, "text/plain", b"body must be an object\n"); return
+        merged = _save_update_policy(payload)
+        self._json(HTTPStatus.OK, merged)
+
     def _api_idle_patch_get(self):
         self._json(HTTPStatus.OK, idle_patch_full_status())
 
@@ -3105,6 +3535,19 @@ def main():
           f"retain={_cfg_preview['retainCount']}/{_cfg_preview['retainDays']}d",
           flush=True)
     AutoBackupScheduler().start()
+    # Game-update detection runs unconditionally — the UI surfaces the
+    # current/latest buildid even without webhooks configured, and the
+    # webhook fires only when one is wired up. _UPDATE_CHECKER is the
+    # module-level singleton the route handlers reach into for the
+    # manual-check button.
+    _UPDATE_CHECKER = UpdateAvailabilityChecker()
+    _UPDATE_CHECKER.start()
+    _policy_preview = _load_update_policy()
+    print(f"  update check:   every {int(UPDATE_CHECK_SECONDS)}s "
+          f"(app {STEAM_APP_ID} branch=public)", flush=True)
+    print(f"  auto-update:    {'on' if _policy_preview['autoUpdateWhenEmpty'] else 'off'}"
+          f" (grace={_policy_preview['graceMinutes']}min)", flush=True)
+    UpdateAutomationScheduler().start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

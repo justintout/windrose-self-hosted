@@ -167,10 +167,21 @@ spec:
             # Leave URLs empty to disable; otherwise either inline or via
             # secretKeyRef — both are consumed verbatim.
             - name: WINDROSE_WEBHOOK_EVENTS
-              value: "server.online,server.offline,player.join,player.leave"
+              value: "server.online,server.offline,player.join,player.leave,game.update.available,game.update.scheduled"
             - name: WINDROSE_WEBHOOK_POLL_SECONDS
               value: "15"
             - name: WINDROSE_WEBHOOK_TIMEOUT
+              value: "5"
+            # Game-update detection. The UI sidecar polls Steam every
+            # WINDROSE_UPDATE_CHECK_SECONDS for the latest public-branch
+            # buildid and compares to the appmanifest SteamCMD wrote on the
+            # last app_update. Floor at 60s in code; 900s = 15 min default.
+            - name: WINDROSE_UPDATE_CHECK_SECONDS
+              value: "900"
+            # Default grace minutes for the auto-update-when-empty policy.
+            # The toggle itself is persisted on the PVC; this only seeds
+            # the default when no override exists.
+            - name: WINDROSE_UPDATE_GRACE_MINUTES
               value: "5"
             # - name: WINDROSE_WEBHOOK_URL
             #   valueFrom:

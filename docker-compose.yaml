@@ -91,9 +91,16 @@ services:
       # fires events (server.online/offline, player.join/leave, plus
       # backup.created, backup.restored, config.applied). Empty URLs
       # disable delivery.
-      WINDROSE_WEBHOOK_EVENTS: ${WINDROSE_WEBHOOK_EVENTS:-server.online,server.offline,player.join,player.leave}
+      WINDROSE_WEBHOOK_EVENTS: ${WINDROSE_WEBHOOK_EVENTS:-server.online,server.offline,player.join,player.leave,game.update.available,game.update.scheduled}
       WINDROSE_WEBHOOK_POLL_SECONDS: ${WINDROSE_WEBHOOK_POLL_SECONDS:-15}
       WINDROSE_WEBHOOK_TIMEOUT: ${WINDROSE_WEBHOOK_TIMEOUT:-5}
+      # Game-update detection. Floor at 60s in code; 900s default keeps the
+      # steamcmd subprocess off the EventDetector's hot loop.
+      WINDROSE_UPDATE_CHECK_SECONDS: ${WINDROSE_UPDATE_CHECK_SECONDS:-900}
+      # Default grace minutes for the auto-update-when-empty policy. The
+      # toggle itself is persisted at ${R5_DIR}/.update-policy.json via the
+      # admin UI; this env only seeds the default when no override exists.
+      WINDROSE_UPDATE_GRACE_MINUTES: ${WINDROSE_UPDATE_GRACE_MINUTES:-5}
       WINDROSE_WEBHOOK_URL: ${WINDROSE_WEBHOOK_URL:-}
       WINDROSE_DISCORD_WEBHOOK_URL: ${WINDROSE_DISCORD_WEBHOOK_URL:-}
     # UI doesn't need host networking; publish to localhost only by default
